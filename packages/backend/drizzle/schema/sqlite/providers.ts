@@ -18,6 +18,7 @@ export const providers = sqliteTable(
     discount: real('discount'),
     estimateTokens: integer('estimate_tokens').notNull().default(0),
     useClaudeMasking: integer('use_claude_masking').notNull().default(0),
+    geminiThinkingEnabled: integer('gemini_thinking_enabled').notNull().default(0),
     headers: text('headers'), // JSON: Record<string, string>
     extraBody: text('extra_body'), // JSON: Record<string, any>
     quotaCheckerType: text('quota_checker_type'),
@@ -32,6 +33,7 @@ export const providers = sqliteTable(
     gpuBandwidthTbS: real('gpu_bandwidth_tb_s'), // Bandwidth in TB/s
     gpuFlopsTflop: real('gpu_flops_tflop'), // FLOPS in TFLOP
     gpuPowerDrawWatts: integer('gpu_power_draw_watts'), // Power draw in watts
+    adapter: text('adapter'), // JSON: string[] — provider-level adapter names
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },

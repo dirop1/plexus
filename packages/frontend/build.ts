@@ -7,8 +7,17 @@ import { spawn } from 'child_process';
 const buildCSS = async () => {
   console.log('Building CSS...');
   const proc = spawn(
-    'bun',
-    ['x', '@tailwindcss/cli', '-i', './src/globals.css', '-o', './dist/main.css'],
+    process.execPath,
+    [
+      'x',
+      '-p',
+      '@tailwindcss/cli',
+      'tailwindcss',
+      '-i',
+      './src/globals.css',
+      '-o',
+      './dist/main.css',
+    ],
     {
       stdio: 'inherit',
       cwd: '.',
@@ -16,6 +25,11 @@ const buildCSS = async () => {
   );
 
   return new Promise<void>((resolve, reject) => {
+    proc.on('error', (error) => {
+      console.error('CSS Build failed.');
+      reject(error);
+    });
+
     proc.on('close', (code) => {
       if (code === 0) {
         console.log('CSS Build complete.');
@@ -81,8 +95,12 @@ const runBuild = async () => {
   html = html.replace('src="/src/main.tsx"', 'src="main.js"'); // Handle both absolute/relative
   html = html.replace('type="module"', '');
 
-  // Inject Favicons and Manifest
+  // Inject Favicons and Manifest. SVG comes first so modern browsers prefer
+  // the new Plexus geometric mark; older browsers fall back to the PNGs.
+  // (SVG is named plexus-icon.svg rather than favicon.svg to avoid an
+  // output-collision with favicon.ico / favicon-*.png in --compile bundling.)
   const faviconHtml = `
+    <link rel="icon" type="image/svg+xml" href="plexus-icon.svg">
     <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
     <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">

@@ -11,9 +11,8 @@ import type {
   CooldownPolicy,
   QuotaConfig,
 } from '../config';
-import { VALID_QUOTA_CHECKER_TYPES } from '../config';
+
 import { QuotaScheduler } from './quota/quota-scheduler';
-import yaml from 'yaml';
 
 /**
  * ConfigService — In-memory cache + DB sync.
@@ -29,6 +28,15 @@ export class ConfigService {
 
   private cache: PlexusConfig | null = null;
   private repo: ConfigRepository;
+
+  /** Number of writes issued since the last rebuild; used for coalescing. */
+  private pendingWrites = 0;
+  /** Active timer for a deferred rebuild. */
+  private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Promise for an in-flight rebuild so parallel callers can wait on it. */
+  private rebuildPromise: Promise<void> | null = null;
+  /** Delay (ms) before a coalesced rebuild fires. */
+  private readonly COALESCE_MS = 100;
 
   constructor(repo?: ConfigRepository) {
     this.repo = repo ?? new ConfigRepository();
@@ -64,8 +72,26 @@ export class ConfigService {
    * Must be called once during startup, after DB is initialized.
    */
   async initialize(): Promise<void> {
-    await this.rebuildCache();
+    await this.executeRebuild();
     logger.debug('ConfigService initialized from database');
+  }
+
+  /**
+   * One-time startup migration that rewrites legacy flat-format aliases into
+   * the grouped target format. After this runs, every alias row has
+   * targetGroups populated and every target row has groupName set.
+   *
+   * TODO(#target-groups-cleanup): remove this method after migration period.
+   */
+  async migrateLegacyTargetGroups(): Promise<string[]> {
+    const migrated = await this.repo.migrateLegacyTargetGroups();
+    if (migrated.length > 0) {
+      logger.info(
+        `Migrated ${migrated.length} legacy aliases to target groups: ${migrated.join(', ')}`
+      );
+      await this.executeRebuild();
+    }
+    return migrated;
   }
 
   /**
@@ -82,10 +108,6 @@ export class ConfigService {
   /**
    * Check whether the database has any providers (first-launch indicator).
    */
-  async isFirstLaunch(): Promise<boolean> {
-    return this.repo.isFirstLaunch();
-  }
-
   getRepository(): ConfigRepository {
     return this.repo;
   }
@@ -94,29 +116,34 @@ export class ConfigService {
 
   async saveProvider(slug: string, config: ProviderConfig): Promise<void> {
     await this.repo.saveProvider(slug, config);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteProvider(slug: string, cascade: boolean = true): Promise<void> {
     await this.repo.deleteProvider(slug, cascade);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   // ─── Alias CRUD ──────────────────────────────────────────────────
 
   async saveAlias(slug: string, config: ModelConfig): Promise<void> {
     await this.repo.saveAlias(slug, config);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteAlias(slug: string): Promise<void> {
     await this.repo.deleteAlias(slug);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteAllAliases(): Promise<number> {
     const count = await this.repo.deleteAllAliases();
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
     return count;
   }
 
@@ -124,48 +151,56 @@ export class ConfigService {
 
   async saveKey(name: string, config: KeyConfig): Promise<void> {
     await this.repo.saveKey(name, config);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteKey(name: string): Promise<void> {
     await this.repo.deleteKey(name);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   // ─── User Quota CRUD ─────────────────────────────────────────────
 
   async saveUserQuota(name: string, quota: QuotaDefinition): Promise<void> {
     await this.repo.saveUserQuota(name, quota);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteUserQuota(name: string): Promise<void> {
     await this.repo.deleteUserQuota(name);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   // ─── MCP Server CRUD ─────────────────────────────────────────────
 
   async saveMcpServer(name: string, config: McpServerConfig): Promise<void> {
     await this.repo.saveMcpServer(name, config);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async deleteMcpServer(name: string): Promise<void> {
     await this.repo.deleteMcpServer(name);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   // ─── Settings ─────────────────────────────────────────────────────
 
   async setSetting(key: string, value: unknown): Promise<void> {
     await this.repo.setSetting(key, value);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async setSettingsBulk(entries: Record<string, unknown>): Promise<void> {
     await this.repo.setSettingsBulk(entries);
-    await this.rebuildCache();
+    this.pendingWrites++;
+    this.rebuildCache();
   }
 
   async getSetting<T>(key: string, defaultValue: T): Promise<T> {
@@ -206,102 +241,7 @@ export class ConfigService {
     this.cache = null;
   }
 
-  // ─── Import from YAML/JSON ──────────────────────────────────────
-
-  /**
-   * Import configuration from a plexus.yaml string into the database.
-   * Used during bootstrap when the DB is empty.
-   */
-  async importFromYaml(yamlContent: string): Promise<void> {
-    const parsed = yaml.parse(yamlContent);
-
-    // Import providers
-    if (parsed.providers && typeof parsed.providers === 'object') {
-      for (const [slug, config] of Object.entries(parsed.providers)) {
-        // Ensure oauth_account is set for OAuth providers
-        const providerConfig = config as any;
-        if (this.isOAuthProvider(providerConfig) && !providerConfig.oauth_account) {
-          providerConfig.oauth_account = 'legacy';
-        }
-        await this.repo.saveProvider(slug, providerConfig as ProviderConfig);
-      }
-      logger.debug(`Imported ${Object.keys(parsed.providers).length} providers`);
-    }
-
-    // Import model aliases
-    if (parsed.models && typeof parsed.models === 'object') {
-      for (const [slug, config] of Object.entries(parsed.models)) {
-        await this.repo.saveAlias(slug, config as ModelConfig);
-      }
-      logger.debug(`Imported ${Object.keys(parsed.models).length} model aliases`);
-    }
-
-    // Import API keys
-    if (parsed.keys && typeof parsed.keys === 'object') {
-      for (const [name, config] of Object.entries(parsed.keys)) {
-        await this.repo.saveKey(name, config as KeyConfig);
-      }
-      logger.debug(`Imported ${Object.keys(parsed.keys).length} API keys`);
-    }
-
-    // Import user quotas
-    if (parsed.user_quotas && typeof parsed.user_quotas === 'object') {
-      for (const [name, config] of Object.entries(parsed.user_quotas)) {
-        await this.repo.saveUserQuota(name, config as QuotaDefinition);
-      }
-      logger.debug(`Imported ${Object.keys(parsed.user_quotas).length} user quotas`);
-    }
-
-    // Import MCP servers
-    if (parsed.mcp_servers && typeof parsed.mcp_servers === 'object') {
-      for (const [name, config] of Object.entries(parsed.mcp_servers)) {
-        await this.repo.saveMcpServer(name, config as McpServerConfig);
-      }
-      logger.debug(`Imported ${Object.keys(parsed.mcp_servers).length} MCP servers`);
-    }
-
-    // Import failover policy
-    if (parsed.failover && typeof parsed.failover === 'object') {
-      const failover = parsed.failover as FailoverPolicy;
-      if (failover.enabled !== undefined) {
-        await this.repo.setSetting('failover.enabled', failover.enabled);
-      }
-      if (failover.retryableStatusCodes) {
-        await this.repo.setSetting('failover.retryableStatusCodes', failover.retryableStatusCodes);
-      }
-      if (failover.retryableErrors) {
-        await this.repo.setSetting('failover.retryableErrors', failover.retryableErrors);
-      }
-      logger.debug('Imported failover policy');
-    }
-
-    // Import cooldown policy
-    if (parsed.cooldown && typeof parsed.cooldown === 'object') {
-      const cooldown = parsed.cooldown as CooldownPolicy;
-      if (cooldown.initialMinutes !== undefined) {
-        await this.repo.setSetting('cooldown.initialMinutes', cooldown.initialMinutes);
-      }
-      if (cooldown.maxMinutes !== undefined) {
-        await this.repo.setSetting('cooldown.maxMinutes', cooldown.maxMinutes);
-      }
-      logger.debug('Imported cooldown policy');
-    }
-
-    // Import exploration rates
-    if (parsed.performanceExplorationRate !== undefined) {
-      await this.repo.setSetting('performanceExplorationRate', parsed.performanceExplorationRate);
-    }
-    if (parsed.latencyExplorationRate !== undefined) {
-      await this.repo.setSetting('latencyExplorationRate', parsed.latencyExplorationRate);
-    }
-
-    // Import vision_fallthrough
-    if (parsed.vision_fallthrough && typeof parsed.vision_fallthrough === 'object') {
-      await this.repo.setSetting('vision_fallthrough', parsed.vision_fallthrough);
-    }
-
-    await this.rebuildCache();
-  }
+  // ─── Import from JSON ────────────────────────────────────────────
 
   /**
    * Import OAuth credentials from auth.json content into the database.
@@ -350,12 +290,83 @@ export class ConfigService {
     };
   }
 
+  // ─── Write Coalescing & Cache Flush ─────────────────────────────
+
+  /**
+   * Force an immediate, synchronous cache rebuild.
+   * Cancels any pending coalesced rebuild and waits for an in-flight one.
+   * Useful in tests or operations that need immediate consistency.
+   */
+  async flush(): Promise<void> {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = null;
+    }
+    if (this.rebuildPromise) {
+      await this.rebuildPromise;
+    }
+    this.pendingWrites = 0;
+    await this.executeRebuild();
+  }
+
   // ─── Internal ────────────────────────────────────────────────────
 
   /**
-   * Rebuild the in-memory cache from the database.
+   * Schedule a cache rebuild, coalescing rapid successive calls.
+   * If pending writes are present the rebuild is deferred; only the
+   * final call in a burst actually hits the database.
    */
-  private async rebuildCache(): Promise<void> {
+  private rebuildCache(): void {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = null;
+    }
+
+    if (this.pendingWrites > 0) {
+      this.coalesceTimer = setTimeout(() => {
+        this.pendingWrites = 0;
+        this.rebuildCache();
+      }, this.COALESCE_MS);
+      return;
+    }
+
+    if (this.rebuildPromise) {
+      this.coalesceTimer = setTimeout(() => this.rebuildCache(), this.COALESCE_MS);
+      return;
+    }
+
+    const promise = this.executeRebuild();
+    this.rebuildPromise = promise;
+    promise.finally(() => {
+      if (this.rebuildPromise === promise) {
+        this.rebuildPromise = null;
+      }
+    });
+  }
+
+  /**
+   * Execute the actual cache rebuild. Guarantees that only one rebuild
+   * runs concurrently; duplicate callers receive the in-flight promise.
+   */
+  private async executeRebuild(): Promise<void> {
+    if (this.rebuildPromise) {
+      return this.rebuildPromise;
+    }
+    const promise = this.doRebuild();
+    this.rebuildPromise = promise;
+    try {
+      await promise;
+    } finally {
+      if (this.rebuildPromise === promise) {
+        this.rebuildPromise = null;
+      }
+    }
+  }
+
+  /**
+   * Core rebuild logic — loads the full config graph from the database.
+   */
+  private async doRebuild(): Promise<void> {
     const providers = await this.repo.getAllProviders();
     const models = await this.repo.getAllAliases();
     const keys = await this.repo.getAllKeys();
@@ -363,32 +374,30 @@ export class ConfigService {
     const mcpServers = await this.repo.getAllMcpServers();
     const failover = await this.repo.getFailoverPolicy();
     const cooldown = await this.repo.getCooldownPolicy();
-    const performanceExplorationRate = await this.repo.getSetting<number>(
-      'performanceExplorationRate',
-      0.05
+    const backgroundExploration = await this.repo.getBackgroundExplorationConfig();
+    const allSettings = await this.repo.getAllSettings();
+
+    // Spread all flat settings (non-dotted keys) onto the cache so new settings
+    // are picked up automatically without needing to touch rebuildCache().
+    const flatSettings = Object.fromEntries(
+      Object.entries(allSettings).filter(([k]) => !k.includes('.'))
     );
-    const latencyExplorationRate = await this.repo.getSetting<number>(
-      'latencyExplorationRate',
-      0.05
-    );
-    const visionFallthrough = await this.repo.getSetting<any>('vision_fallthrough', undefined);
 
     // Build quota configs from providers (same logic as buildProviderQuotaConfigs)
     const quotas = this.buildProviderQuotaConfigs(providers);
 
     this.cache = {
+      ...flatSettings,
       providers,
       models,
       keys,
       failover,
       cooldown,
+      backgroundExploration,
       quotas,
       mcpServers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
       mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
       user_quotas: Object.keys(userQuotas).length > 0 ? userQuotas : undefined,
-      performanceExplorationRate,
-      latencyExplorationRate,
-      ...(visionFallthrough ? { vision_fallthrough: visionFallthrough } : {}),
     };
 
     // Reload the quota scheduler with the updated quota configs so that

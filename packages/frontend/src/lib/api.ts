@@ -200,6 +200,9 @@ export interface ProviderPerformanceData {
   avg_tokens_per_sec: number;
   min_tokens_per_sec: number;
   max_tokens_per_sec: number;
+  avg_e2e_tokens_per_sec: number;
+  min_e2e_tokens_per_sec: number;
+  max_e2e_tokens_per_sec: number;
   sample_count: number;
   last_updated: number;
 }
@@ -216,6 +219,7 @@ export interface Provider {
   disableCooldown?: boolean;
   estimateTokens?: boolean;
   useClaudeMasking?: boolean;
+  geminiThinkingEnabled?: boolean;
   discount?: number;
   headers?: Record<string, string>;
   extraBody?: Record<string, any>;
@@ -232,6 +236,7 @@ export interface Provider {
   gpu_bandwidth_tb_s?: number;
   gpu_flops_tflop?: number;
   gpu_power_draw_watts?: number;
+  adapter?: string[];
 }
 
 export interface McpServer {
@@ -357,13 +362,20 @@ export type AliasMetadata =
       overrides: MetadataOverrides & { name: string };
     };
 
+export interface AliasTargetGroup {
+  name: string;
+  selector: string;
+  targets: Array<{ provider: string; model: string; apiType?: string[]; enabled?: boolean }>;
+}
+
+export type PreferredApiValue = 'chat_completions' | 'messages' | 'gemini' | 'responses';
+
 export interface Alias {
   id: string;
   aliases?: string[];
-  selector?: string;
   priority?: 'selector' | 'api_match';
   type?: 'chat' | 'embeddings' | 'transcriptions' | 'speech' | 'image' | 'responses';
-  targets: Array<{ provider: string; model: string; apiType?: string[]; enabled?: boolean }>;
+  target_groups: AliasTargetGroup[];
   advanced?: AliasBehavior[];
   metadata?: AliasMetadata;
   use_image_fallthrough?: boolean;
@@ -379,6 +391,9 @@ export interface Alias {
     dtype?: 'fp16' | 'bf16' | 'fp8' | 'fp8_e4m3' | 'fp8_e5m2' | 'nvfp4' | 'int4' | 'int8';
   };
   enforce_limits?: boolean;
+  sticky_session?: boolean;
+  preferred_api?: Array<PreferredApiValue>;
+  pi_model?: { provider: string; model_id: string };
 }
 
 export interface InferenceError {
@@ -528,76 +543,30 @@ const summaryRequestCache = new Map<
 const CONFIG_CACHE_TTL_MS = 20000;
 const configRequestCache = new Map<string, { expiresAt: number; promise: Promise<any> }>();
 
-// Cache for quota checker types fetched from backend
-let quotaCheckerTypesCache: Set<string> | null = null;
-let quotaCheckerTypesCacheTime: number = 0;
-const QUOTA_TYPES_CACHE_TTL_MS = 60000; // 1 minute cache
-
-// Fallback types - will be used until fetched from server
-const FALLBACK_QUOTA_CHECKER_TYPES = new Set([
-  'synthetic',
-  'naga',
-  'nanogpt',
-  'openai-codex',
-  'claude-code',
-  'zai',
-  'moonshot',
-  'novita',
-  'minimax',
-  'minimax-coding',
-  'kimi-code',
-  'openrouter',
-  'kilo',
-  'wisdomgate',
-  'apertis',
-  'copilot',
-  'poe',
-  'gemini-cli',
-  'antigravity',
-  'ollama',
-  'neuralwatt',
-  'zenmux',
-]);
-
-/**
- * Fetch valid quota checker types from the backend
- */
-async function fetchQuotaCheckerTypes(): Promise<Set<string>> {
-  const now = Date.now();
-  if (quotaCheckerTypesCache && now - quotaCheckerTypesCacheTime < QUOTA_TYPES_CACHE_TTL_MS) {
-    return quotaCheckerTypesCache;
-  }
-
-  try {
-    const response = await fetchWithAuth(`${API_BASE}/v0/management/quota-checker-types`);
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.types)) {
-        quotaCheckerTypesCache = new Set(data.types);
-        quotaCheckerTypesCacheTime = now;
-        return quotaCheckerTypesCache;
-      }
-    }
-  } catch (error) {
-    // Silently fail and use fallback
-  }
-
-  return FALLBACK_QUOTA_CHECKER_TYPES;
+export interface QuotaCheckerType {
+  type: string;
+  displayName: string;
 }
 
-/**
- * Get valid quota checker types (sync version - returns fallback if not fetched)
- * Call fetchQuotaCheckerTypes() early to populate the cache
- */
-export function getQuotaCheckerTypes(): Set<string> {
-  return quotaCheckerTypesCache || FALLBACK_QUOTA_CHECKER_TYPES;
+export interface QuotaCheckersResponse {
+  knownTypes: QuotaCheckerType[];
+  configured: (QuotaCheckerInfo & { displayName: string; pending: boolean })[];
 }
 
-/**
- * Initialize quota checker types cache
- */
-export async function initQuotaCheckerTypes(): Promise<void> {
-  await fetchQuotaCheckerTypes();
+export async function fetchQuotaCheckers(): Promise<QuotaCheckersResponse> {
+  const response = await fetchWithAuth(`${API_BASE}/v0/management/quota-checkers`);
+  if (!response.ok) throw new Error('Failed to fetch quota checkers');
+  const data = await response.json();
+  return {
+    knownTypes: data.knownTypes ?? [],
+    configured: (data.configured ?? []).map(
+      (c: QuotaCheckerInfo & { displayName: string; pending: boolean }) => ({
+        ...normalizeQuotaCheckerInfo(c),
+        displayName: c.displayName,
+        pending: c.pending,
+      })
+    ),
+  };
 }
 
 // Re-export GpuProfileOption from shared package for use by other components
@@ -614,10 +583,9 @@ const normalizeProviderQuotaChecker = (checker?: {
   const type = checker.type?.trim();
   if (!type) return undefined;
 
-  const isValidType = getQuotaCheckerTypes().has(type);
   return {
     type,
-    enabled: isValidType ? checker.enabled !== false : false,
+    enabled: checker.enabled !== false,
     intervalMinutes: Math.max(1, Number(checker.intervalMinutes || 30)),
     options: checker.options,
   };
@@ -1514,6 +1482,9 @@ export const api = {
         avg_tokens_per_sec: toNumber(row.avg_tokens_per_sec),
         min_tokens_per_sec: toNumber(row.min_tokens_per_sec),
         max_tokens_per_sec: toNumber(row.max_tokens_per_sec),
+        avg_e2e_tokens_per_sec: toNumber(row.avg_e2e_tokens_per_sec),
+        min_e2e_tokens_per_sec: toNumber(row.min_e2e_tokens_per_sec),
+        max_e2e_tokens_per_sec: toNumber(row.max_e2e_tokens_per_sec),
         sample_count: toNumber(row.sample_count),
         last_updated: toNumber(row.last_updated),
       }));
@@ -1685,6 +1656,7 @@ export const api = {
           enabled: val.enabled !== false,
           estimateTokens: val.estimateTokens || false,
           useClaudeMasking: val.useClaudeMasking === true,
+          geminiThinkingEnabled: val.gemini_thinking_enabled === true,
           disableCooldown: val.disable_cooldown === true,
           discount: val.discount,
           headers: val.headers,
@@ -1694,6 +1666,7 @@ export const api = {
               : {},
           models: normalizedModels,
           quotaChecker: normalizeProviderQuotaChecker(val.quota_checker),
+          adapter: val.adapter ? (Array.isArray(val.adapter) ? val.adapter : [val.adapter]) : [],
         };
       });
     } catch (e) {
@@ -1712,6 +1685,7 @@ export const api = {
       enabled: provider.enabled,
       estimateTokens: provider.estimateTokens,
       useClaudeMasking: provider.useClaudeMasking,
+      geminiThinkingEnabled: provider.geminiThinkingEnabled,
       disable_cooldown: provider.disableCooldown === true ? true : undefined,
       discount: provider.discount,
       headers: provider.headers,
@@ -1736,6 +1710,7 @@ export const api = {
       ...(provider.gpu_power_draw_watts != null
         ? { gpu_power_draw_watts: provider.gpu_power_draw_watts }
         : {}),
+      ...(provider.adapter && provider.adapter.length > 0 ? { adapter: provider.adapter } : {}),
     };
 
     const res = await fetchWithAuth(
@@ -1816,7 +1791,10 @@ export const api = {
       const affected: { aliasId: string; targetsCount: number }[] = [];
 
       for (const alias of aliases) {
-        const targetsCount = alias.targets.filter((t) => t.provider === providerId).length;
+        const targetsCount = alias.target_groups.reduce(
+          (sum, g) => sum + g.targets.filter((t) => t.provider === providerId).length,
+          0
+        );
         if (targetsCount > 0) {
           affected.push({ aliasId: alias.id, targetsCount });
         }
@@ -1831,20 +1809,29 @@ export const api = {
 
   saveAlias: async (alias: Alias, oldId?: string): Promise<void> => {
     const body: any = {
-      selector: alias.selector,
       priority: alias.priority || 'selector',
       additional_aliases: alias.aliases,
       use_image_fallthrough: alias.use_image_fallthrough || false,
       enforce_limits: alias.enforce_limits || false,
+      sticky_session: alias.sticky_session || false,
+      ...(alias.preferred_api &&
+        alias.preferred_api.length > 0 && {
+          preferred_api: alias.preferred_api,
+        }),
       ...(alias.type && { type: alias.type }),
       ...(alias.advanced && alias.advanced.length > 0 && { advanced: alias.advanced }),
       ...(alias.metadata && { metadata: alias.metadata }),
+      ...(alias.pi_model && { pi_model: alias.pi_model }),
       // Model architecture override for inference energy calculation
       ...(alias.model_architecture && { model_architecture: alias.model_architecture }),
-      targets: alias.targets.map((t) => ({
-        provider: t.provider,
-        model: t.model,
-        ...(t.enabled === false && { enabled: false }),
+      target_groups: alias.target_groups.map((g) => ({
+        name: g.name,
+        selector: g.selector,
+        targets: g.targets.map((t) => ({
+          provider: t.provider,
+          model: t.model,
+          ...(t.enabled === false && { enabled: false }),
+        })),
       })),
     };
 
@@ -1919,44 +1906,45 @@ export const api = {
       const aliases: Alias[] = [];
 
       Object.entries(aliasMap).forEach(([key, val]) => {
-        const targets = (val.targets || []).map(
-          (t: { provider: string; model: string; enabled?: boolean }) => {
-            const providerConfig = providers[t.provider];
-
-            // Infer type from api_base_url if not explicitly provided
-            const inferredTypes =
-              providerConfig?.type || inferProviderTypes(providerConfig?.api_base_url);
-            let apiType: string | string[] = inferredTypes;
-
-            // Check for specific model config overrides (access_via)
-            if (providerConfig?.models && !Array.isArray(providerConfig.models)) {
-              const modelConfig = providerConfig.models[t.model];
-              if (modelConfig && modelConfig.access_via && modelConfig.access_via.length > 0) {
-                apiType = modelConfig.access_via;
-              }
+        const readTarget = (t: any) => {
+          const providerConfig = providers[t.provider];
+          const inferredTypes =
+            providerConfig?.type || inferProviderTypes(providerConfig?.api_base_url);
+          let apiType: string | string[] = inferredTypes;
+          if (providerConfig?.models && !Array.isArray(providerConfig.models)) {
+            const modelConfig = providerConfig.models[t.model];
+            if (modelConfig?.access_via?.length > 0) {
+              apiType = modelConfig.access_via;
             }
-
-            return {
-              provider: t.provider,
-              model: t.model,
-              apiType: Array.isArray(apiType) ? apiType : [apiType],
-              enabled: t.enabled !== false,
-            };
           }
-        );
+          return {
+            provider: t.provider,
+            model: t.model,
+            apiType: Array.isArray(apiType) ? apiType : [apiType],
+            enabled: t.enabled !== false,
+          };
+        };
+
+        const targetGroups: AliasTargetGroup[] = (val.target_groups || []).map((g: any) => ({
+          name: g.name || 'default',
+          selector: g.selector || 'random',
+          targets: (g.targets || []).map(readTarget),
+        }));
 
         aliases.push({
           id: key,
           aliases: val.additional_aliases || [],
-          selector: val.selector,
           priority: val.priority,
           type: val.type,
+          target_groups: targetGroups,
           use_image_fallthrough: val.use_image_fallthrough || false,
           enforce_limits: val.enforce_limits || false,
+          sticky_session: val.sticky_session || false,
           advanced: val.advanced || [],
-          targets,
           metadata: val.metadata,
           model_architecture: val.model_architecture,
+          preferred_api: val.preferred_api || [],
+          pi_model: val.pi_model,
         });
       });
       return aliases;
@@ -2543,6 +2531,25 @@ export const api = {
     return json.data;
   },
 
+  getPiProviders: async (): Promise<string[]> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/pi/providers`);
+    if (!res.ok) throw new Error('Failed to fetch pi providers');
+    const json = (await res.json()) as { data: string[] };
+    return json.data;
+  },
+
+  getPiModels: async (
+    provider: string,
+    q?: string
+  ): Promise<Array<{ id: string; name: string; api: string }>> => {
+    const params = new URLSearchParams({ provider });
+    if (q) params.set('q', q);
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/pi/models?${params}`);
+    if (!res.ok) throw new Error('Failed to fetch pi models');
+    const json = (await res.json()) as { data: Array<{ id: string; name: string; api: string }> };
+    return json.data;
+  },
+
   getOAuthProviderModels: async (
     providerId: string
   ): Promise<
@@ -2965,6 +2972,185 @@ export const api = {
       const err = await res.json().catch(() => ({ error: { message: 'Unknown error' } }));
       throw new Error(err.error?.message || `Failed to fetch model architecture: ${res.status}`);
     }
+    return res.json();
+  },
+
+  /** Export a config-only backup as JSON. */
+  createBackup: async (): Promise<Blob> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/backup`);
+    if (!res.ok) throw new Error('Failed to create backup');
+    return res.blob();
+  },
+
+  /** Export a full backup (config + operational data) as a .tar.gz archive. */
+  createFullBackup: async (): Promise<Blob> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/backup?full=true`);
+    if (!res.ok) throw new Error('Failed to create full backup');
+    return res.blob();
+  },
+
+  /** Restore from a config-only JSON backup. */
+  restoreBackup: async (
+    data: object
+  ): Promise<{
+    success: boolean;
+    restored: Record<string, number>;
+    message: string;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Restore failed' }));
+      throw new Error(err.error || 'Restore failed');
+    }
+    return res.json();
+  },
+
+  /** Restore from a full .tar.gz backup archive. */
+  restoreFullBackup: async (
+    file: File
+  ): Promise<{
+    success: boolean;
+    restored: Record<string, number>;
+    message: string;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: await file.arrayBuffer(),
+    } as RequestInit);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Restore failed' }));
+      throw new Error(err.error || 'Restore failed');
+    }
+    return res.json();
+  },
+
+  // ─── Failover Settings ────────────────────────────────────────────
+
+  /** Fetch current failover policy. */
+  getFailoverPolicy: async (): Promise<{
+    enabled: boolean;
+    retryableStatusCodes: number[];
+    retryableErrors: string[];
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/failover`);
+    if (!res.ok) throw new Error('Failed to fetch failover policy');
+    return res.json();
+  },
+
+  /** Patch failover policy fields. */
+  patchFailoverPolicy: async (updates: {
+    enabled?: boolean;
+    retryableStatusCodes?: number[];
+    retryableErrors?: string[];
+  }): Promise<{
+    enabled: boolean;
+    retryableStatusCodes: number[];
+    retryableErrors: string[];
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/failover`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (!res.ok) throw new Error('Failed to update failover policy');
+    return res.json();
+  },
+
+  // ─── Cooldown Settings ──────────────────────────────────────────────
+
+  /** Fetch current cooldown policy. */
+  getCooldownPolicy: async (): Promise<{
+    initialMinutes: number;
+    maxMinutes: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/cooldown`);
+    if (!res.ok) throw new Error('Failed to fetch cooldown policy');
+    return res.json();
+  },
+
+  /** Patch cooldown policy fields. */
+  patchCooldownPolicy: async (updates: {
+    initialMinutes?: number;
+    maxMinutes?: number;
+  }): Promise<{
+    initialMinutes: number;
+    maxMinutes: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/cooldown`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (!res.ok) throw new Error('Failed to update cooldown policy');
+    return res.json();
+  },
+
+  // ─── Exploration Rate Settings ─────────────────────────────────────
+
+  /** Fetch current exploration rate settings. */
+  getExplorationRates: async (): Promise<{
+    performanceExplorationRate: number;
+    latencyExplorationRate: number;
+    e2ePerformanceExplorationRate: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/exploration-rate`);
+    if (!res.ok) throw new Error('Failed to fetch exploration rate settings');
+    return res.json();
+  },
+
+  /** Patch exploration rate settings. */
+  patchExplorationRates: async (updates: {
+    performanceExplorationRate?: number;
+    latencyExplorationRate?: number;
+    e2ePerformanceExplorationRate?: number;
+  }): Promise<{
+    performanceExplorationRate: number;
+    latencyExplorationRate: number;
+    e2ePerformanceExplorationRate: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/exploration-rate`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (!res.ok) throw new Error('Failed to update exploration rate settings');
+    return res.json();
+  },
+
+  // ─── Background Exploration Settings ──────────────────────────
+
+  /** Fetch current background exploration settings. */
+  getBackgroundExploration: async (): Promise<{
+    enabled: boolean;
+    stalenessThresholdSeconds: number;
+    workerConcurrency: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/background-exploration`);
+    if (!res.ok) throw new Error('Failed to fetch background exploration settings');
+    return res.json();
+  },
+
+  /** Patch background exploration settings. */
+  patchBackgroundExploration: async (updates: {
+    enabled?: boolean;
+    stalenessThresholdSeconds?: number;
+    workerConcurrency?: number;
+  }): Promise<{
+    enabled: boolean;
+    stalenessThresholdSeconds: number;
+    workerConcurrency: number;
+  }> => {
+    const res = await fetchWithAuth(`${API_BASE}/v0/management/config/background-exploration`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (!res.ok) throw new Error('Failed to update background exploration settings');
     return res.json();
   },
 };

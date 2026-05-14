@@ -34,6 +34,7 @@ export async function registerResponsesRoute(
   // Handler for Responses API requests (shared between /v1/responses and /v1/codex/responses)
   const responsesHandler = async (request: FastifyRequest, reply: FastifyReply) => {
     const requestId = crypto.randomUUID();
+    reply.header('x-request-id', requestId);
     const startTime = Date.now();
     let usageRecord: Partial<UsageRecord> = {
       requestId,
@@ -128,6 +129,9 @@ export async function registerResponsesRoute(
       unifiedRequest.incomingApiType = 'responses';
       unifiedRequest.originalBody = body;
       unifiedRequest.requestId = requestId;
+      if (body.previous_response_id) {
+        unifiedRequest.previousResponseId = body.previous_response_id;
+      }
 
       // Forward cache routing headers for prompt caching support.
       // These headers enable server-side cache routing at the upstream provider.

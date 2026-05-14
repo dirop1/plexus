@@ -4,6 +4,8 @@
 
 <img src="docs/images/plexus_logo_transparent.png" alt="Plexus Logo" width="120"/>
 
+### 💬 [Join the Plexus Discord Community](https://discord.com/channels/292942011261124608/1503831216095367239) — generously hosted by [Linux.chat](https://linux.chat)
+
 ### [🚀 API Reference](/docs/openapi/openapi.yaml) | [⚙️ Configuration](docs/CONFIGURATION.md) | [📦 Installation](docs/INSTALLATION.md) | [🔬 Testing](docs/TESTING.md)
 
 Plexus is a high-performance API gateway that unifies access to multiple AI providers (OpenAI, Anthropic, Google, GitHub Copilot, and more) under a single endpoint. Switch models and providers without rewriting client code.
@@ -80,10 +82,17 @@ ADMIN_KEY="your-admin-password" ./plexus
 curl -L https://github.com/mcowger/plexus/releases/latest/download/plexus-linux -o plexus
 chmod +x plexus
 ADMIN_KEY="your-admin-password" ./plexus
-
-# Windows (x64) — download plexus.exe from the releases page, then:
-# set ADMIN_KEY=your-admin-password && plexus.exe
 ```
+
+```powershell
+# Windows (x64, PowerShell)
+Invoke-WebRequest -Uri "https://github.com/mcowger/plexus/releases/latest/download/plexus.exe" -OutFile "plexus.exe"
+$env:ADMIN_KEY = "your-admin-password"
+$env:DATABASE_URL = "sqlite://./data/plexus.db"
+.\plexus.exe
+```
+
+For Windows troubleshooting and Command Prompt usage, see [Running the Windows Standalone Binary](docs/INSTALLATION.md#running-the-windows-standalone-binary).
 
 The binary is self-contained — no runtime or external dependencies required. Database migration files and the web dashboard are embedded inside the binary.
 
@@ -141,7 +150,8 @@ Define model aliases backed by one or more providers. Choose how targets are sel
 | `in_order` | Try providers in order; fall back when one is unhealthy |
 | `cost` | Always route to the cheapest configured provider |
 | `performance` | Route to the highest tokens/sec provider (with exploration) |
-| `latency` | Route to the lowest time-to-first-token provider |
+| `latency` | Route to the lowest time-to-first-token provider (with exploration) |
+| `e2e_performance` | Route to the highest overall TPS *including* TTFT (with exploration) |
 
 Use `priority: api_match` to prefer providers that natively speak the incoming API format, enabling pass-through optimization.
 
@@ -162,7 +172,7 @@ A request sent in Anthropic format can be routed to an OpenAI provider — Plexu
 
 ### OAuth Providers
 
-Use AI services you already have subscriptions to without managing API keys. Plexus integrates with [pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai) to support OAuth-backed providers:
+Use AI services you already have subscriptions to without managing API keys. Plexus integrates with [pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai) to support OAuth-backed providers:
 
 - Anthropic Claude
 - OpenAI Codex

@@ -31,6 +31,7 @@ export const providers = pgTable(
     discount: real('discount'),
     estimateTokens: boolean('estimate_tokens').notNull().default(false),
     useClaudeMasking: boolean('use_claude_masking').notNull().default(false),
+    geminiThinkingEnabled: boolean('gemini_thinking_enabled').notNull().default(false),
     headers: text('headers'), // JSON or encrypted string — text for encryption compatibility
     extraBody: text('extra_body'), // JSON — not encrypted, text for consistency
     quotaCheckerType: quotaCheckerTypeEnum('quota_checker_type'),
@@ -45,6 +46,7 @@ export const providers = pgTable(
     gpuBandwidthTbS: real('gpu_bandwidth_tb_s'), // Bandwidth in TB/s
     gpuFlopsTflop: real('gpu_flops_tflop'), // FLOPS in TFLOP
     gpuPowerDrawWatts: integer('gpu_power_draw_watts'), // Power draw in watts
+    adapter: jsonb('adapter'), // string[] — provider-level adapter names
     createdAt: bigint('created_at', { mode: 'number' }).notNull(),
     updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
   },

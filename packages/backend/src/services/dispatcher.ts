@@ -16,13 +16,16 @@ import { TransformerFactory } from './transformer-factory';
 import { logger } from '../utils/logger';
 import { QUOTA_ERROR_PATTERNS } from '../utils/constants';
 import { CooldownManager } from './cooldown-manager';
+import { StickySessionManager } from './sticky-session-manager';
 import { RouteResult } from './router';
 import { DebugManager } from './debug-manager';
 import { UsageStorageService } from './usage-storage';
 import { CooldownParserRegistry } from './cooldown-parsers';
 import { getConfig, getProviderTypes } from '../config';
 import { applyModelBehaviors } from './model-behaviors';
-import { getModels } from '@mariozechner/pi-ai';
+import { resolveAdapters } from './adapter-resolver';
+import type { ProviderAdapter } from '../types/provider-adapter';
+import { getModels } from '@earendil-works/pi-ai';
 import { VisionDescriptorService } from './vision-descriptor-service';
 import { ModelMetadataManager } from './model-metadata-manager';
 import { enforceContextLimit } from './enforce-limits';
@@ -41,6 +44,7 @@ interface RetryAttemptRecord {
   reason: string;
   statusCode?: number;
   retryable?: boolean;
+  providerResponseHeaders?: Record<string, string>;
 }
 
 interface ParseFailureContext {
@@ -50,6 +54,16 @@ interface ParseFailureContext {
 
 interface RetryHistoryLikeEntry {
   reason?: unknown;
+}
+
+/**
+ * Strips trailing /v1beta* path segments from Gemini base URLs.
+ * Gemini's transformer adds /v1beta to the path, so we need to ensure
+ * the base URL doesn't include it to avoid duplication like /v1beta/v1beta/...
+ * Only strips beta versions (e.g. /v1beta, /v1beta1) — plain /v1 is valid for other APIs.
+ */
+function stripTrailingApiVersion(url: string): string {
+  return url.replace(/\/(v\d+beta\d*)$/i, '');
 }
 
 export class Dispatcher {
@@ -180,13 +194,64 @@ export class Dispatcher {
     this.usageStorage = storage;
   }
 
+  private saveIntermediateError(requestId: string | undefined, apiType: string, error: any): void {
+    if (!this.usageStorage || !requestId) return;
+    this.usageStorage.saveError(requestId, error, {
+      apiType,
+      ...(error?.routingContext || {}),
+    });
+  }
+
+  /**
+   * Emit an early routing update so the frontend shows provider/model immediately.
+   * The route handler emits a second update after dispatch, but for non-streaming
+   * requests that can be seconds later — this one fires as soon as routing is done.
+   */
+  private emitRoutingUpdate(requestId: string | undefined, route: RouteResult): void {
+    if (!requestId || !this.usageStorage) return;
+    this.usageStorage.emitUpdatedAsync({
+      requestId,
+      provider: route.provider,
+      selectedModelName: route.model,
+      canonicalModelName: route.canonicalModel,
+    });
+  }
+
+  /**
+   * Persist the (alias, sessionKey) → (provider, model) mapping after a
+   * successful dispatch so the next turn of this conversation can prefer the
+   * same target. No-op when stickiness doesn't apply (no session key, no
+   * canonical alias, or vision-descriptor sub-request).
+   */
+  private recordStickySession(
+    sessionKey: string | null,
+    route: RouteResult,
+    request: UnifiedChatRequest
+  ): void {
+    if (!sessionKey || !route.canonicalModel) return;
+    if ((request as any)._isVisionDescriptorRequest) return;
+    const aliasConfig = getConfig().models?.[route.canonicalModel];
+    if (!aliasConfig?.sticky_session) return;
+    StickySessionManager.getInstance().set(
+      route.canonicalModel,
+      sessionKey,
+      route.provider,
+      route.model
+    );
+  }
+
   async dispatch(request: UnifiedChatRequest): Promise<UnifiedChatResponse> {
     const config = getConfig();
     const failover = config.failover;
     const failoverEnabled = failover?.enabled !== false;
 
     // 1. Route (ordered candidates)
-    let candidates = await Router.resolveCandidates(request.model, request.incomingApiType);
+    const sessionKey = StickySessionManager.computeSessionKey(request);
+    let candidates = await Router.resolveCandidates(
+      request.model,
+      request.incomingApiType,
+      sessionKey
+    );
 
     // Fallback for direct/provider/model syntax and legacy single-route behavior
     if (candidates.length === 0) {
@@ -291,6 +356,8 @@ export class Dispatcher {
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
 
+      this.emitRoutingUpdate(currentRequest.requestId, route);
+
       try {
         // Determine Target API Type
         const { targetApiType, selectionReason } = this.selectTargetApiType(
@@ -309,12 +376,16 @@ export class Dispatcher {
         // 3. Transform Request
         const requestWithTargetModel = { ...currentRequest, model: route.model };
 
+        // Resolve adapters for this specific provider+model combination
+        const adapters = resolveAdapters(route);
+
         const { payload: providerPayload, bypassTransformation } =
           await this.transformRequestPayload(
             requestWithTargetModel,
             route,
             transformer,
-            targetApiType
+            targetApiType,
+            adapters
           );
 
         // Capture transformed request
@@ -362,6 +433,11 @@ export class Dispatcher {
                 visionFallthroughModel: (currentRequest as any)._visionFallthroughModel,
               });
               await this.markOAuthProviderFailure(route, oauthError);
+              this.saveIntermediateError(
+                currentRequest.requestId,
+                targetApiType || 'chat',
+                oauthError
+              );
               logger.warn(
                 `Failover: retrying after OAuth error from ${route.provider}/${route.model}: ${oauthError.message}`
               );
@@ -424,6 +500,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(currentRequest.requestId, targetApiType || 'chat', e);
               logger.warn(
                 `Failover: retrying after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -462,6 +539,7 @@ export class Dispatcher {
                 undefined,
                 this.formatFailureReason(error)
               );
+              this.saveIntermediateError(currentRequest.requestId, targetApiType || 'chat', error);
               logger.warn(
                 `Failover: retrying stream before first byte after ${route.provider}/${route.model} failure: ${error.message}`
               );
@@ -476,7 +554,8 @@ export class Dispatcher {
             currentRequest,
             route,
             targetApiType,
-            bypassTransformation
+            bypassTransformation,
+            adapters
           );
           await this.recordAttemptMetric(route, currentRequest.requestId, true, {
             isVisionFallthrough: (currentRequest as any)._hasVisionFallthrough,
@@ -484,6 +563,7 @@ export class Dispatcher {
             visionFallthroughModel: (currentRequest as any)._visionFallthroughModel,
           });
           CooldownManager.getInstance().markProviderSuccess(route.provider, route.model);
+          this.recordStickySession(sessionKey, route, currentRequest);
           this.appendSuccessAttempt(retryHistory, route, targetApiType);
           this.attachAttemptMetadata(
             streamResponse,
@@ -501,7 +581,8 @@ export class Dispatcher {
           route,
           targetApiType,
           transformer,
-          bypassTransformation
+          bypassTransformation,
+          adapters
         );
         await this.recordAttemptMetric(route, currentRequest.requestId, true, {
           isVisionFallthrough: (currentRequest as any)._hasVisionFallthrough,
@@ -514,6 +595,7 @@ export class Dispatcher {
         }
 
         CooldownManager.getInstance().markProviderSuccess(route.provider, route.model);
+        this.recordStickySession(sessionKey, route, currentRequest);
         this.appendSuccessAttempt(retryHistory, route, targetApiType);
         this.attachAttemptMetadata(
           nonStreamingResponse,
@@ -553,6 +635,11 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, undefined, canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(
+            currentRequest.requestId,
+            error?.routingContext?.targetApiType || 'chat',
+            error
+          );
           logger.warn(
             `Failover: retrying after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );
@@ -826,6 +913,7 @@ export class Dispatcher {
       reason,
       statusCode: typeof statusCode === 'number' ? statusCode : undefined,
       retryable,
+      providerResponseHeaders: error?.routingContext?.providerResponseHeaders,
     });
   }
 
@@ -1140,8 +1228,58 @@ export class Dispatcher {
       }
     }
 
-    // Ensure api_base_url doesn't end with slash
-    return rawBaseUrl.replace(/\/$/, '');
+    // Ensure api_base_url doesn't end with slash and strip trailing /v1beta if present
+    // (the transformer adds its own /v1beta path segment)
+    return stripTrailingApiVersion(rawBaseUrl.replace(/\/$/, ''));
+  }
+
+  /**
+   * Converts reasoning field to thinkingConfig for Gemini API.
+   * Gemini's OpenAI-compatible endpoint doesn't support 'reasoning' at top level,
+   * so we map request.reasoning.effort to generationConfig.thinkingConfig instead.
+   */
+  private applyGeminiThinkingConfig(route: RouteResult, targetApiType: string, payload: any): any {
+    const baseUrl = this.resolveBaseUrl(route, targetApiType).toLowerCase();
+    const isGemini = baseUrl.includes('generativelanguage.googleapis.com');
+    const enabled = route.config.geminiThinkingEnabled === true;
+
+    // Gemini's OpenAI-compatible endpoint doesn't support 'reasoning' at top level
+    // Always strip it, and if enabled, map reasoning.effort to thinkingConfig
+    if (isGemini && payload.reasoning && enabled) {
+      const { reasoning, ...restPayload } = payload;
+      const result: any = { ...restPayload };
+
+      // Map reasoning.effort to Gemini's thinkingLevel
+      // OpenAI ThinkLevel: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+      // Gemini ThinkingLevel: 'low' | 'medium' | 'high'
+      const effort = reasoning?.effort;
+      if (effort && effort !== 'none' && effort !== 'minimal') {
+        let thinkingLevel: 'low' | 'medium' | 'high';
+        if (effort === 'low') {
+          thinkingLevel = 'low';
+        } else if (effort === 'medium') {
+          thinkingLevel = 'medium';
+        } else {
+          // 'high' or 'xhigh' map to 'high'
+          thinkingLevel = 'high';
+        }
+
+        result.generationConfig = {
+          ...payload.generationConfig,
+          thinkingConfig: {
+            thinkingLevel,
+          },
+        };
+      }
+
+      return result;
+    } else if (isGemini && payload.reasoning) {
+      // Config not enabled but have reasoning - just strip it
+      const { reasoning: _, ...restPayload } = payload;
+      return restPayload;
+    }
+
+    return payload;
   }
 
   private isOAuthRoute(route: RouteResult, targetApiType: string): boolean {
@@ -1773,12 +1911,16 @@ export class Dispatcher {
     request: UnifiedChatRequest,
     route: RouteResult,
     transformer: any,
-    targetApiType: string
+    targetApiType: string,
+    adapters: ProviderAdapter[] = []
   ): Promise<{ payload: any; bypassTransformation: boolean }> {
     let providerPayload: any;
     let bypassTransformation = false;
 
-    if (this.shouldUsePassThrough(request, targetApiType, route)) {
+    // Adapters require full transformation — suppress pass-through when any are active
+    const hasAdapters = adapters.length > 0;
+
+    if (!hasAdapters && this.shouldUsePassThrough(request, targetApiType, route)) {
       logger.debug(
         `Pass-through optimization active: ${request.incomingApiType} -> ${targetApiType}`
       );
@@ -1815,6 +1957,9 @@ export class Dispatcher {
       providerPayload = await transformer.transformRequest(request);
     }
 
+    // Convert reasoning field to thinkingConfig for Gemini API
+    providerPayload = this.applyGeminiThinkingConfig(route, targetApiType, providerPayload);
+
     // Merge provider-level extraBody first
     if (route.config.extraBody) {
       providerPayload = { ...providerPayload, ...route.config.extraBody };
@@ -1834,6 +1979,18 @@ export class Dispatcher {
           canonicalModel: route.canonicalModel,
         });
       }
+    }
+
+    // Apply provider/model adapters (preDispatch) in configured order
+    for (const adapter of adapters) {
+      providerPayload = adapter.preDispatch(providerPayload);
+    }
+
+    if (adapters.length > 0) {
+      logger.debug(
+        `Adapters applied (preDispatch): [${adapters.map((a) => a.name).join(', ')}] ` +
+          `for ${route.provider}/${route.model}`
+      );
     }
 
     return { payload: providerPayload, bypassTransformation };
@@ -1971,6 +2128,7 @@ export class Dispatcher {
       headers: this.sanitizeHeaders(headers || {}),
       statusCode: response.status,
       providerResponse: errorText,
+      providerResponseHeaders: this.extractResponseHeaders(response),
       cooldownTriggered: !isCallerError,
     };
 
@@ -1980,6 +2138,17 @@ export class Dispatcher {
     }
 
     throw error;
+  }
+
+  /**
+   * Extract all provider response headers from a fetch Response
+   */
+  private extractResponseHeaders(response: Response): Record<string, string> {
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    return headers;
   }
 
   /**
@@ -2045,11 +2214,23 @@ export class Dispatcher {
     request: UnifiedChatRequest,
     route: RouteResult,
     targetApiType: string,
-    bypassTransformation: boolean
+    bypassTransformation: boolean,
+    adapters: ProviderAdapter[] = []
   ): UnifiedChatResponse {
     logger.debug('Streaming response detected');
 
-    const rawStream = response.body!;
+    let rawStream: ReadableStream = response.body!;
+
+    // If any adapter defines preDispatchStreamChunk, pipe the raw SSE stream
+    // through a rewrite transform before it reaches transformStream().
+    const streamAdapters = adapters.filter((a) => a.preDispatchStreamChunk);
+    if (streamAdapters.length > 0) {
+      rawStream = rawStream.pipeThrough(this.buildSseRewriteTransform(streamAdapters));
+      logger.debug(
+        `Stream adapters applied (preDispatchStreamChunk): [${streamAdapters.map((a) => a.name).join(', ')}] ` +
+          `for ${route.provider}/${route.model}`
+      );
+    }
 
     const streamResponse: UnifiedChatResponse = {
       id: 'stream-' + Date.now(),
@@ -2065,6 +2246,44 @@ export class Dispatcher {
   }
 
   /**
+   * Builds a TransformStream that rewrites raw SSE lines through the
+   * preDispatchStreamChunk hooks of the given adapters.
+   * Handles chunked delivery — lines may arrive split across multiple chunks.
+   */
+  private buildSseRewriteTransform(
+    adapters: ProviderAdapter[]
+  ): TransformStream<Uint8Array, Uint8Array> {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    return new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        // Keep the last (possibly incomplete) segment in the buffer
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          let rewritten = line;
+          for (const adapter of adapters) {
+            rewritten = adapter.preDispatchStreamChunk!(rewritten);
+          }
+          controller.enqueue(encoder.encode(rewritten + '\n'));
+        }
+      },
+      flush(controller) {
+        if (buffer.length > 0) {
+          let rewritten = buffer;
+          for (const adapter of adapters) {
+            rewritten = adapter.preDispatchStreamChunk!(rewritten);
+          }
+          controller.enqueue(encoder.encode(rewritten));
+        }
+      },
+    });
+  }
+
+  /**
    * Handles non-streaming responses
    */
   private async handleNonStreamingResponse(
@@ -2073,15 +2292,29 @@ export class Dispatcher {
     route: RouteResult,
     targetApiType: string,
     transformer: any,
-    bypassTransformation: boolean
+    bypassTransformation: boolean,
+    adapters: ProviderAdapter[] = []
   ): Promise<UnifiedChatResponse> {
-    const responseBody = await this.parseJsonResponseBody(
+    let responseBody = await this.parseJsonResponseBody(
       response,
       request.requestId,
       route,
       targetApiType
     );
     logger.silly('Upstream Response Payload', responseBody);
+
+    // Apply provider/model adapters (postDispatch) in reverse order
+    if (adapters.length > 0) {
+      for (let i = adapters.length - 1; i >= 0; i--) {
+        responseBody = adapters[i]!.postDispatch(responseBody);
+      }
+      logger.debug(
+        `Adapters applied (postDispatch): [${[...adapters]
+          .reverse()
+          .map((a) => a.name)
+          .join(', ')}] ` + `for ${route.provider}/${route.model}`
+      );
+    }
 
     if (request.requestId) {
       DebugManager.getInstance().addRawResponse(request.requestId, responseBody);
@@ -2154,6 +2387,8 @@ export class Dispatcher {
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
 
+      this.emitRoutingUpdate(request.requestId, route);
+
       try {
         const baseUrl = this.resolveBaseUrl(route, 'embeddings');
         const url = `${baseUrl}/embeddings`;
@@ -2224,6 +2459,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(request.requestId, 'embeddings', e);
               logger.warn(
                 `Failover: retrying embeddings after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -2285,6 +2521,7 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, 'embeddings', canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(request.requestId, 'embeddings', error);
           logger.warn(
             `Failover: retrying embeddings after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );
@@ -2346,6 +2583,8 @@ export class Dispatcher {
       }
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
+
+      this.emitRoutingUpdate(request.requestId, route);
 
       try {
         const baseUrl = this.resolveBaseUrl(route, 'transcriptions');
@@ -2420,6 +2659,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(request.requestId, 'transcriptions', e);
               logger.warn(
                 `Failover: retrying transcription after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -2488,6 +2728,7 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, 'transcriptions', canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(request.requestId, 'transcriptions', error);
           logger.warn(
             `Failover: retrying transcription after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );
@@ -2548,6 +2789,8 @@ export class Dispatcher {
       }
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
+
+      this.emitRoutingUpdate(request.requestId, route);
 
       try {
         const baseUrl = this.resolveBaseUrl(route, 'speech');
@@ -2622,6 +2865,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(request.requestId, 'speech', e);
               logger.warn(
                 `Failover: retrying speech after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -2655,6 +2899,7 @@ export class Dispatcher {
                 undefined,
                 error.message
               );
+              this.saveIntermediateError(request.requestId, 'speech', error);
               logger.warn(
                 `Failover: retrying speech stream before first byte after ${route.provider}/${route.model} failure: ${error.message}`
               );
@@ -2724,6 +2969,7 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, 'speech', canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(request.requestId, 'speech', error);
           logger.warn(
             `Failover: retrying speech after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );
@@ -2785,6 +3031,8 @@ export class Dispatcher {
       }
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
+
+      this.emitRoutingUpdate(request.requestId, route);
 
       try {
         const baseUrl = this.resolveBaseUrl(route, 'images');
@@ -2858,6 +3106,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(request.requestId, 'images', e);
               logger.warn(
                 `Failover: retrying image generation after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -2918,6 +3167,7 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, 'images', canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(request.requestId, 'images', error);
           logger.warn(
             `Failover: retrying image generation after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );
@@ -2978,6 +3228,8 @@ export class Dispatcher {
       }
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
+
+      this.emitRoutingUpdate(request.requestId, route);
 
       try {
         const baseUrl = this.resolveBaseUrl(route, 'images');
@@ -3050,6 +3302,7 @@ export class Dispatcher {
                   this.formatFailureReason(e, true)
                 );
               }
+              this.saveIntermediateError(request.requestId, 'images', e);
               logger.warn(
                 `Failover: retrying image edit after HTTP ${response.status} from ${route.provider}/${route.model}`
               );
@@ -3110,6 +3363,7 @@ export class Dispatcher {
         this.appendFailureAttempt(retryHistory, route, error, 'images', canRetryNetwork);
 
         if (canRetryNetwork) {
+          this.saveIntermediateError(request.requestId, 'images', error);
           logger.warn(
             `Failover: retrying image edit after network/transport error from ${route.provider}/${route.model}: ${error.message}`
           );

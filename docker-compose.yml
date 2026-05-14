@@ -3,12 +3,10 @@ services:
     build: .
     image: plexus:latest
     container_name: plexus
-    platform: linux/amd64
     restart: unless-stopped
     ports:
       - "4000:4000"
     volumes:
-      - ./config:/app/config
       - ./data:/app/data
     environment:
       - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY is required}
@@ -16,4 +14,3 @@ services:
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
       - LOG_LEVEL=info
       - DATA_DIR=/app/data
-      - CONFIG_FILE=/app/config/plexus.yaml

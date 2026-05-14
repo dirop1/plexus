@@ -1,4 +1,4 @@
-import { Selector } from './base';
+import { Selector, CandidateStats } from './base';
 import { ModelTarget, getConfig } from '../../config';
 import { UsageStorageService } from '../usage-storage';
 import { logger } from '../../utils/logger';
@@ -22,7 +22,8 @@ export class PerformanceSelector extends Selector {
 
     // Get exploration rate from config (default 5%)
     const config = getConfig();
-    const explorationRate = config.performanceExplorationRate ?? 0.05;
+    const bgEnabled = config.backgroundExploration?.enabled === true;
+    const explorationRate = bgEnabled ? 0 : (config.performanceExplorationRate ?? 0.05);
 
     // If no performance data exists, we might want to fall back to random or first.
     // For now, let's assume we want to pick the one with highest known performance.
@@ -34,17 +35,23 @@ export class PerformanceSelector extends Selector {
     // Given targets usually small (2-5), individual queries are fine.
 
     const candidates: { target: ModelTarget; tps: number }[] = [];
+    const explorationStats: CandidateStats[] = [];
 
     for (const target of targets) {
       const stats = await this.storage.getProviderPerformance(target.provider, target.model);
+      const targetStats = stats[0];
 
       let avgTps = 0;
-      if (stats && stats.length > 0) {
-        // stats[0] contains the aggregated data for this provider/model
-        avgTps = stats[0].avg_tokens_per_sec || 0;
+      if (targetStats) {
+        avgTps = targetStats.avg_tokens_per_sec || 0;
       }
 
       candidates.push({ target, tps: avgTps });
+      explorationStats.push({
+        target,
+        sampleCount: targetStats?.sample_count ?? 0,
+        lastUpdated: targetStats?.last_updated ?? 0,
+      });
     }
 
     // Sort by TPS descending
@@ -59,14 +66,19 @@ export class PerformanceSelector extends Selector {
 
         // Check if we should explore a different provider (randomly choose from non-best targets)
         if (explorationRate > 0 && Math.random() < explorationRate && candidates.length > 1) {
-          const nonBestCandidates = candidates.slice(1);
-          const randomChoice =
-            nonBestCandidates[Math.floor(Math.random() * nonBestCandidates.length)];
-          if (randomChoice) {
-            logger.debug(
-              `PerformanceSelector: Exploring - selected ${randomChoice.target.provider}/${randomChoice.target.model} with ${randomChoice.tps.toFixed(2)} TPS (instead of ${best.target.provider}/${best.target.model} with ${best.tps.toFixed(2)} TPS)`
+          const explorationChoice = this.pickExplorationTarget(explorationStats);
+          if (explorationChoice) {
+            const choiceStats = candidates.find(
+              (c) =>
+                c.target.provider === explorationChoice.provider &&
+                c.target.model === explorationChoice.model
             );
-            return randomChoice.target;
+            logger.debug(
+              `PerformanceSelector: Exploring - selected ${explorationChoice.provider}/${explorationChoice.model} with ${
+                choiceStats?.tps.toFixed(2) ?? '0.00'
+              } TPS (instead of ${best.target.provider}/${best.target.model} with ${best.tps.toFixed(2)} TPS)`
+            );
+            return explorationChoice;
           }
         }
 

@@ -2,11 +2,12 @@ import { FastifyInstance } from 'fastify';
 import { getConfig } from '../../config';
 import { PricingManager } from '../../services/pricing-manager';
 import { ModelMetadataManager, mergeOverrides } from '../../services/model-metadata-manager';
+import { getModel } from '@earendil-works/pi-ai';
 
 export async function registerModelsRoute(fastify: FastifyInstance) {
   /**
    * GET /v1/models
-   * Returns a list of available model aliases configured in plexus.yaml,
+   * Returns a list of available model aliases configured in the database,
    * following the OpenRouter/OpenAI model list format.
    *
    * When an alias has a `metadata` block configured, the response includes
@@ -24,12 +25,32 @@ export async function registerModelsRoute(fastify: FastifyInstance) {
 
     const models = Object.entries(config.models).map(([aliasId, modelConfig]) => {
       const metaConfig = modelConfig?.metadata;
+      const piModelConfig = modelConfig?.pi_model;
+
+      // Look up pi compat options if a pi model reference is configured.
+      let piOptions: Record<string, unknown> | undefined;
+      if (piModelConfig) {
+        try {
+          const piModel = getModel(piModelConfig.provider as any, piModelConfig.model_id as any);
+          if (piModel?.compat && Object.keys(piModel.compat).length > 0) {
+            piOptions = piModel.compat as Record<string, unknown>;
+          }
+        } catch {
+          // Unknown provider or model — skip silently.
+        }
+      }
 
       const base = {
         id: aliasId,
         object: 'model' as const,
         created,
         owned_by: 'plexus',
+        ...(modelConfig?.preferred_api !== undefined && {
+          preferred_api: modelConfig.preferred_api,
+        }),
+        ...(piModelConfig && { pi_provider: piModelConfig.provider }),
+        ...(piModelConfig && { pi_model: piModelConfig.model_id }),
+        ...(piOptions !== undefined && { pi_options: piOptions }),
       };
 
       if (!metaConfig) {

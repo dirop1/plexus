@@ -9,17 +9,19 @@
     "test": "bunx --bun vitest run --config vitest.config.ts --changed HEAD",
     "test:force-all": "bunx --bun vitest run --config vitest.config.ts",
     "test:watch": "bunx --bun vitest --config vitest.config.ts",
-    "rekey": "bun run src/cli/rekey.ts"
+    "rekey": "bun run src/cli/rekey.ts",
+    "backup": "bun run src/cli/backup.ts"
   },
   "dependencies": {
     "@fastify/bearer-auth": "^10.1.2",
     "@fastify/cors": "^11.2.0",
     "@fastify/multipart": "^10.0.0",
     "@fastify/static": "^9.1.3",
-    "@google/genai": "^1.50.1",
-    "@mariozechner/pi-ai": "0.70.5",
+    "@google/genai": "^1.52.0",
+    "@earendil-works/pi-ai": "0.74.0",
     "@plexus/shared": "workspace:*",
     "@sinclair/typebox": "^0.34.49",
+    "csv-parse": "^6.2.1",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "drizzle-zod": "^0.8.3",
@@ -32,8 +34,8 @@
     "postgres": "^3.4.9",
     "winston": "^3.19.0",
     "winston-transport": "^4.9.0",
-    "yaml": "^2.8.3",
-    "zod": "^4.3.6"
+    "yaml": "^2.8.4",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.4.5",

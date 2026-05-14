@@ -124,7 +124,7 @@ info:
     | Variable | Purpose |
     |---|---|
     | `ADMIN_KEY` | Master admin key for management endpoints. |
-    | `CONFIG_FILE` | Path to the YAML configuration file. |
+    | `DATA_DIR` | Directory for SQLite database and data files. |
     | `LOG_LEVEL` | Runtime log level (`error`, `warn`, `info`, `debug`, `verbose`, `silly`). |
     | `DEBUG` | Set to `true` to enable debug log capture at startup. |
     | `PLEXUS_METRICS_CACHE_TTL_MS` | TTL for the Prometheus metrics cache in milliseconds. |
@@ -286,7 +286,7 @@ tags:
       ### Assignment vs enforcement separation
 
       - **Assignment**: A quota definition is linked to a key via the key's
-        `quota` field in `plexus.yaml` or via the keys API.
+        `quota` field or via the keys API.
       - **Enforcement**: The middleware evaluates the key's usage against its
         assigned quota definition at request time. If `quota_name` is null,
         the key has no quota and is unlimited.
@@ -300,6 +300,21 @@ tags:
     description: Synthetic inference request used by the admin UI.
   - name: Management — Restart
     description: Graceful process restart.
+  - name: Management — Backup
+    description: >-
+      Full database export and import for disaster recovery and migration.
+      Two backup modes are available:
+
+      - **Config-only** (default): Exports providers, model aliases, API keys,
+        user quotas, MCP servers, system settings, and OAuth credentials as a
+        JSON envelope. Small and fast — covers most migration and cloning needs.
+      - **Full backup** (`?full=true`): Exports configuration plus all
+        operational/telemetry data (usage records, debug logs, errors, cooldowns,
+        performance stats, quota snapshots, responses) as a gzipped tar archive
+        with per-table compressed CSV files.
+
+      Both endpoints are admin-only. Backup files contain decrypted secrets
+      (API keys, OAuth tokens) and should be stored securely.
   - name: Management — Models
     description: External model metadata helpers (HuggingFace).
   - name: Events
@@ -389,6 +404,14 @@ paths:
     $ref: paths/v0_management_config_export.yaml
   /v0/management/config/vision-fallthrough:
     $ref: paths/v0_management_config_vision-fallthrough.yaml
+  /v0/management/config/background-exploration:
+    $ref: paths/v0_management_config_background-exploration.yaml
+  /v0/management/config/cooldown:
+    $ref: paths/v0_management_config_cooldown.yaml
+  /v0/management/config/exploration-rate:
+    $ref: paths/v0_management_config_exploration-rate.yaml
+  /v0/management/config/failover:
+    $ref: paths/v0_management_config_failover.yaml
   /v0/management/system-settings:
     $ref: paths/v0_management_system-settings.yaml
   /v0/management/providers:
@@ -397,6 +420,10 @@ paths:
     $ref: paths/v0_management_providers_{slug}.yaml
   /v0/management/providers/fetch-models:
     $ref: paths/v0_management_providers_fetch-models.yaml
+  /v0/management/pi/providers:
+    $ref: paths/v0_management_pi_providers.yaml
+  /v0/management/pi/models:
+    $ref: paths/v0_management_pi_models.yaml
   /v0/management/aliases:
     $ref: paths/v0_management_aliases.yaml
   /v0/management/aliases/{slug}:
@@ -417,6 +444,16 @@ paths:
     $ref: paths/v0_management_mcp-servers_{serverName}.yaml
   /v0/management/quota-checker-types:
     $ref: paths/v0_management_quota-checker-types.yaml
+  /v0/management/quota-checkers:
+    $ref: paths/v0_management_quota-checkers.yaml
+  /v0/management/quotas/backup-legacy-snapshots:
+    $ref: paths/v0_management_quotas_backup-legacy-snapshots.yaml
+  /v0/management/quotas/legacy-snapshot-status:
+    $ref: paths/v0_management_quotas_legacy-snapshot-status.yaml
+  /v0/management/quotas/migrate-legacy-snapshots:
+    $ref: paths/v0_management_quotas_migrate-legacy-snapshots.yaml
+  /v0/management/quotas/truncate-legacy-snapshots:
+    $ref: paths/v0_management_quotas_truncate-legacy-snapshots.yaml
   /v0/management/usage:
     $ref: paths/v0_management_usage.yaml
   /v0/management/usage/summary:
@@ -489,6 +526,10 @@ paths:
     $ref: paths/v0_management_test.yaml
   /v0/management/restart:
     $ref: paths/v0_management_restart.yaml
+  /v0/management/backup:
+    $ref: paths/v0_management_backup.yaml
+  /v0/management/restore:
+    $ref: paths/v0_management_restore.yaml
   /v0/management/events:
     $ref: paths/v0_management_events.yaml
   /v0/system/logs/stream:

@@ -1,13 +1,13 @@
 import { FastifyInstance } from 'fastify';
 import { logger } from '../../utils/logger';
 import {
-  VALID_QUOTA_CHECKER_TYPES,
   ProviderConfigSchema,
   ModelConfigSchema,
   KeyConfigSchema,
   McpServerConfigSchema,
 } from '../../config';
 import { ConfigService } from '../../services/config-service';
+import { getCheckerDefinitions } from '../../services/quota/checker-registry';
 import { UsageStorageService } from '../../services/usage-storage';
 import type { GpuParams, ModelArchitecture } from '@plexus/shared';
 import { DEFAULT_GPU_PARAMS } from '@plexus/shared';
@@ -74,11 +74,8 @@ export async function registerConfigRoutes(
 
   fastify.get('/v0/management/config/status', async (_request, reply) => {
     try {
-      // Check if ADMIN_KEY was loaded from YAML (deprecated, but kept for backward compatibility)
-      const adminKeyFromYaml = process.env.ADMIN_KEY_FROM_YAML === 'true';
-      return reply.send({
-        adminKeyFromYaml: adminKeyFromYaml,
-      });
+      // No longer relevant - Plexus no longer supports YAML config
+      return reply.send({});
     } catch (e: any) {
       return reply.code(500).send({ error: 'Internal server error' });
     }
@@ -355,6 +352,237 @@ export async function registerConfigRoutes(
     }
   });
 
+  // ─── Failover Policy ─────────────────────────────────────────────
+
+  fastify.get('/v0/management/config/failover', async (_request, reply) => {
+    try {
+      const failover = await configService.getRepository().getFailoverPolicy();
+      return reply.send(failover);
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  fastify.patch('/v0/management/config/failover', async (request, reply) => {
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return reply.code(400).send({ error: 'Object body is required' });
+    }
+
+    try {
+      // Read current values, merge with updates, and write back
+      const current = await configService.getRepository().getFailoverPolicy();
+      const merged = { ...current, ...body };
+
+      if (body.enabled !== undefined) {
+        await configService.setSetting('failover.enabled', merged.enabled);
+      }
+      if (body.retryableStatusCodes !== undefined) {
+        await configService.setSetting(
+          'failover.retryableStatusCodes',
+          merged.retryableStatusCodes
+        );
+      }
+      if (body.retryableErrors !== undefined) {
+        await configService.setSetting('failover.retryableErrors', merged.retryableErrors);
+      }
+
+      // Return the final merged state
+      const updated = await configService.getRepository().getFailoverPolicy();
+      logger.debug('Failover policy updated via API');
+      return reply.send(updated);
+    } catch (e: any) {
+      logger.error('Failed to patch failover config', e);
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // ─── Cooldown Policy ──────────────────────────────────────────────
+
+  fastify.get('/v0/management/config/cooldown', async (_request, reply) => {
+    try {
+      const cooldown = await configService.getRepository().getCooldownPolicy();
+      return reply.send(cooldown);
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  fastify.patch('/v0/management/config/cooldown', async (request, reply) => {
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return reply.code(400).send({ error: 'Object body is required' });
+    }
+
+    try {
+      // Read current values, merge with updates, and write back
+      const current = await configService.getRepository().getCooldownPolicy();
+      const merged = { ...current, ...body };
+
+      // Validate cooldown values (minimum 0.1 minutes / 6 seconds)
+      if (body.initialMinutes !== undefined) {
+        const val = Number(merged.initialMinutes);
+        if (!Number.isFinite(val) || val < 0.1) {
+          return reply.code(400).send({ error: 'initialMinutes must be at least 0.1' });
+        }
+        await configService.setSetting('cooldown.initialMinutes', val);
+      }
+      if (body.maxMinutes !== undefined) {
+        const val = Number(merged.maxMinutes);
+        if (!Number.isFinite(val) || val < 0.1) {
+          return reply.code(400).send({ error: 'maxMinutes must be at least 0.1' });
+        }
+        await configService.setSetting('cooldown.maxMinutes', val);
+      }
+
+      // Return the final merged state
+      const updated = await configService.getRepository().getCooldownPolicy();
+      logger.debug('Cooldown policy updated via API');
+      return reply.send(updated);
+    } catch (e: any) {
+      logger.error('Failed to patch cooldown config', e);
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // ─── Exploration Rate ─────────────────────────────────────────────
+
+  fastify.get('/v0/management/config/exploration-rate', async (_request, reply) => {
+    try {
+      const performanceExplorationRate = await configService.getSetting<number>(
+        'performanceExplorationRate',
+        0.05
+      );
+      const latencyExplorationRate = await configService.getSetting<number>(
+        'latencyExplorationRate',
+        0.05
+      );
+      const e2ePerformanceExplorationRate = await configService.getSetting<number>(
+        'e2ePerformanceExplorationRate',
+        0.05
+      );
+      return reply.send({
+        performanceExplorationRate,
+        latencyExplorationRate,
+        e2ePerformanceExplorationRate,
+      });
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  fastify.patch('/v0/management/config/exploration-rate', async (request, reply) => {
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return reply.code(400).send({ error: 'Object body is required' });
+    }
+
+    try {
+      if (body.performanceExplorationRate !== undefined) {
+        const value = Number(body.performanceExplorationRate);
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          return reply
+            .code(400)
+            .send({ error: 'performanceExplorationRate must be a number between 0 and 1' });
+        }
+        await configService.setSetting('performanceExplorationRate', value);
+      }
+      if (body.latencyExplorationRate !== undefined) {
+        const value = Number(body.latencyExplorationRate);
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          return reply
+            .code(400)
+            .send({ error: 'latencyExplorationRate must be a number between 0 and 1' });
+        }
+        await configService.setSetting('latencyExplorationRate', value);
+      }
+      if (body.e2ePerformanceExplorationRate !== undefined) {
+        const value = Number(body.e2ePerformanceExplorationRate);
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          return reply
+            .code(400)
+            .send({ error: 'e2ePerformanceExplorationRate must be a number between 0 and 1' });
+        }
+        await configService.setSetting('e2ePerformanceExplorationRate', value);
+      }
+
+      const performanceExplorationRate = await configService.getSetting<number>(
+        'performanceExplorationRate',
+        0.05
+      );
+      const latencyExplorationRate = await configService.getSetting<number>(
+        'latencyExplorationRate',
+        0.05
+      );
+      const e2ePerformanceExplorationRate = await configService.getSetting<number>(
+        'e2ePerformanceExplorationRate',
+        0.05
+      );
+      logger.debug('Exploration rate settings updated via API');
+      return reply.send({
+        performanceExplorationRate,
+        latencyExplorationRate,
+        e2ePerformanceExplorationRate,
+      });
+    } catch (e: any) {
+      logger.error('Failed to patch exploration rate config', e);
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // ─── Background Exploration ──────────────────────────────────────
+
+  fastify.get('/v0/management/config/background-exploration', async (_request, reply) => {
+    try {
+      const cfg = await configService.getRepository().getBackgroundExplorationConfig();
+      return reply.send(cfg);
+    } catch (e: any) {
+      logger.error('Failed to read background-exploration config', e);
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  fastify.patch('/v0/management/config/background-exploration', async (request, reply) => {
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return reply.code(400).send({ error: 'Object body is required' });
+    }
+
+    try {
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== 'boolean') {
+          return reply.code(400).send({ error: 'enabled must be a boolean' });
+        }
+        await configService.setSetting('backgroundExploration.enabled', body.enabled);
+      }
+      if (body.stalenessThresholdSeconds !== undefined) {
+        const val = Number(body.stalenessThresholdSeconds);
+        if (!Number.isFinite(val) || !Number.isInteger(val) || val < 1) {
+          return reply
+            .code(400)
+            .send({ error: 'stalenessThresholdSeconds must be an integer >= 1' });
+        }
+        await configService.setSetting('backgroundExploration.stalenessThresholdSeconds', val);
+      }
+      if (body.workerConcurrency !== undefined) {
+        const val = Number(body.workerConcurrency);
+        if (!Number.isFinite(val) || !Number.isInteger(val) || val < 1 || val > 16) {
+          return reply
+            .code(400)
+            .send({ error: 'workerConcurrency must be an integer between 1 and 16' });
+        }
+        await configService.setSetting('backgroundExploration.workerConcurrency', val);
+      }
+
+      const updated = await configService.getRepository().getBackgroundExplorationConfig();
+      logger.debug('Background exploration config updated via API');
+      return reply.send(updated);
+    } catch (e: any) {
+      logger.error('Failed to patch background-exploration config', e);
+      return reply.code(500).send({ error: 'Internal server error' });
+    }
+  });
+
   // ─── Vision Fallthrough ───────────────────────────────────────────
 
   fastify.get('/v0/management/config/vision-fallthrough', async (_request, reply) => {
@@ -434,18 +662,10 @@ export async function registerConfigRoutes(
   // ─── Quota Checker Types ──────────────────────────────────────────
 
   fastify.get('/v0/management/quota-checker-types', async (_request, reply) => {
+    const defs = getCheckerDefinitions();
     return reply.send({
-      types: VALID_QUOTA_CHECKER_TYPES,
-      count: VALID_QUOTA_CHECKER_TYPES.length,
+      types: defs.map((d) => ({ type: d.type, displayName: d.displayName })),
+      count: defs.length,
     });
   });
-
-  // Support YAML and Plain Text payloads for management API
-  fastify.addContentTypeParser(
-    ['text/plain', 'application/x-yaml', 'text/yaml'],
-    { parseAs: 'string' },
-    (req, body, done) => {
-      done(null, body);
-    }
-  );
 }

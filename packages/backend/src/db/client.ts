@@ -34,7 +34,17 @@ function parseConnectionString(uri: string): {
   connectionString: string;
 } {
   if (uri.startsWith('sqlite://')) {
-    return { dialect: 'sqlite', connectionString: uri.replace('sqlite://', '') };
+    let connStr = uri.replace('sqlite://', '');
+    // Normalize :memory: path (handles sqlite://:memory: and sqlite://:memory:/)
+    if (
+      connStr === ':memory:' ||
+      connStr === 'memory:' ||
+      connStr === ':memory:/' ||
+      connStr === 'memory:/'
+    ) {
+      connStr = ':memory:';
+    }
+    return { dialect: 'sqlite', connectionString: connStr };
   } else if (uri.startsWith('postgres://') || uri.startsWith('postgresql://')) {
     return { dialect: 'postgres', connectionString: uri };
   }
@@ -42,7 +52,7 @@ function parseConnectionString(uri: string): {
 }
 
 function resolvePath(relPath: string): string {
-  if (relPath.startsWith('/')) return relPath;
+  if (path.isAbsolute(relPath)) return relPath;
   if (relPath.startsWith('./')) {
     return path.resolve(process.cwd(), relPath);
   }

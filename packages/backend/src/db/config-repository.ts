@@ -18,6 +18,7 @@ import type {
   McpServerConfig,
   FailoverPolicy,
   CooldownPolicy,
+  BackgroundExplorationConfig,
   MetadataOverrides,
 } from '../config';
 import { resolveGpuParams } from '@plexus/shared';
@@ -290,6 +291,7 @@ export class ConfigRepository {
       discount: config.discount ?? null,
       estimateTokens: fromBool(config.estimateTokens === true),
       useClaudeMasking: fromBool(config.useClaudeMasking === true),
+      geminiThinkingEnabled: fromBool(config.geminiThinkingEnabled === true),
       headers: config.headers ? encryptJsonField(config.headers) : null,
       extraBody: config.extraBody ? toJson(config.extraBody) : null,
       quotaCheckerType: config.quota_checker?.type ?? null,
@@ -305,6 +307,10 @@ export class ConfigRepository {
       gpuBandwidthTbS: config.gpu_bandwidth_tb_s ?? null,
       gpuFlopsTflop: config.gpu_flops_tflop ?? null,
       gpuPowerDrawWatts: config.gpu_power_draw_watts ?? null,
+      adapter:
+        config.adapter && (Array.isArray(config.adapter) ? config.adapter.length > 0 : true)
+          ? toJson(Array.isArray(config.adapter) ? config.adapter : [config.adapter])
+          : null,
       updatedAt: timestamp,
     };
 
@@ -357,6 +363,10 @@ export class ConfigRepository {
           modelType: cfg.type ?? null,
           accessVia: cfg.access_via ? toJson(cfg.access_via) : null,
           extraBody: cfg.extraBody ? toJson(cfg.extraBody) : null,
+          adapter:
+            cfg.adapter && (Array.isArray(cfg.adapter) ? cfg.adapter.length > 0 : true)
+              ? toJson(Array.isArray(cfg.adapter) ? cfg.adapter : [cfg.adapter])
+              : null,
           sortOrder: idx,
         }));
         if (modelRows.length > 0) {
@@ -428,6 +438,7 @@ export class ConfigRepository {
             ...(m.modelType ? { type: m.modelType } : {}),
             ...(m.accessVia ? { access_via: parseJson(m.accessVia) } : {}),
             ...(m.extraBody ? { extraBody: parseJson(m.extraBody) } : {}),
+            ...(m.adapter ? { adapter: parseJson(m.adapter) } : {}),
           };
         }
       } else {
@@ -461,6 +472,7 @@ export class ConfigRepository {
       ...(row.discount !== null ? { discount: row.discount } : {}),
       estimateTokens: toBool(row.estimateTokens),
       useClaudeMasking: toBool(row.useClaudeMasking),
+      gemini_thinking_enabled: toBool(row.geminiThinkingEnabled),
       ...(models ? { models } : {}),
       ...(row.headers ? { headers: decryptJsonField(row.headers) } : {}),
       ...(() => {
@@ -468,6 +480,10 @@ export class ConfigRepository {
         return eb && typeof eb === 'object' && !Array.isArray(eb) ? { extraBody: eb } : {};
       })(),
       ...(quota_checker ? { quota_checker } : {}),
+      ...(() => {
+        const adapterVal = parseJson<string[]>(row.adapter);
+        return Array.isArray(adapterVal) && adapterVal.length > 0 ? { adapter: adapterVal } : {};
+      })(),
       // GPU Profile settings — resolve named profiles to concrete values for
       // backward compatibility with existing DB rows that may only have gpuProfile
       // set without the numeric fields.
@@ -594,6 +610,55 @@ export class ConfigRepository {
     return rows.length > 0 ? rows[0] : null;
   }
 
+  /**
+   * One-time startup migration: rewrite legacy aliases that have no targetGroups
+   * into the grouped format. Operates at raw row level so no application code
+   * needs to understand the legacy layout.
+   *
+   * TODO(#target-groups-cleanup): remove this whole method after migration period.
+   */
+  async migrateLegacyTargetGroups(): Promise<string[]> {
+    const schema = this.schema();
+
+    // Find aliases that have not yet been migrated
+    const legacyAliases = await this.db()
+      .select()
+      .from(schema.modelAliases)
+      .where(sql`${schema.modelAliases.targetGroups} IS NULL`);
+
+    const migrated: string[] = [];
+
+    for (const row of legacyAliases) {
+      const targets = await this.db()
+        .select()
+        .from(schema.modelAliasTargets)
+        .where(eq(schema.modelAliasTargets.aliasId, row.id));
+
+      const selector = row.selector ?? 'random';
+
+      // Write group definition to alias row
+      await this.db()
+        .update(schema.modelAliases)
+        .set({
+          targetGroups: toJson([{ name: 'default', selector }]),
+          updatedAt: now(),
+        })
+        .where(eq(schema.modelAliases.id, row.id));
+
+      // Tag all targets with the default group name
+      if (targets.length > 0) {
+        await this.db()
+          .update(schema.modelAliasTargets)
+          .set({ groupName: 'default' })
+          .where(eq(schema.modelAliasTargets.aliasId, row.id));
+      }
+
+      migrated.push(row.slug);
+    }
+
+    return migrated;
+  }
+
   async saveAlias(slug: string, config: ModelConfig): Promise<void> {
     const schema = this.schema();
     const timestamp = now();
@@ -611,6 +676,13 @@ export class ConfigRepository {
       // Model architecture override for inference energy calculation
       modelArchitecture: config.model_architecture ? toJson(config.model_architecture) : null,
       enforceLimits: fromBool(config.enforce_limits === true),
+      stickySession: fromBool(config.sticky_session === true),
+      preferredApi: config.preferred_api ? toJson(config.preferred_api) : null,
+      piModel: config.pi_model ? toJson(config.pi_model) : null,
+      targetGroups:
+        config.target_groups && config.target_groups.length > 0
+          ? toJson(config.target_groups.map((g) => ({ name: g.name, selector: g.selector })))
+          : null,
       updatedAt: timestamp,
     };
 
@@ -644,15 +716,24 @@ export class ConfigRepository {
         .delete(schema.modelAliasTargets)
         .where(eq(schema.modelAliasTargets.aliasId, aliasId));
 
-      if (config.targets && config.targets.length > 0) {
-        const targetRows = config.targets.map((t, idx) => ({
-          aliasId,
-          providerSlug: t.provider,
-          modelName: t.model,
-          enabled: fromBool(t.enabled !== false),
-          sortOrder: idx,
-        }));
-        await tx.insert(schema.modelAliasTargets).values(targetRows);
+      if (config.target_groups && config.target_groups.length > 0) {
+        let sortIdx = 0;
+        const targetRows: any[] = [];
+        for (const group of config.target_groups) {
+          for (const t of group.targets) {
+            targetRows.push({
+              aliasId,
+              providerSlug: t.provider,
+              modelName: t.model,
+              enabled: fromBool(t.enabled !== false),
+              groupName: group.name,
+              sortOrder: sortIdx++,
+            });
+          }
+        }
+        if (targetRows.length > 0) {
+          await tx.insert(schema.modelAliasTargets).values(targetRows);
+        }
       }
 
       // Replace metadata overrides
@@ -703,23 +784,42 @@ export class ConfigRepository {
   }
 
   private rowToModelConfig(row: any, targetRows: any[], overrideRow?: any | null): ModelConfig {
-    const targets = targetRows.map((t: any) => ({
-      provider: t.providerSlug,
-      model: t.modelName,
-      enabled: toBool(t.enabled),
-    }));
+    const groupDefs = parseJson<Array<{ name: string; selector: string }>>(row.targetGroups);
+
+    // build target_groups from group definitions + target rows
+    const targetGroups: import('../config').ModelTargetGroup[] = [];
+    if (groupDefs && groupDefs.length > 0) {
+      for (const def of groupDefs) {
+        const groupTargets = targetRows
+          .filter((t: any) => t.groupName === def.name)
+          .sort((a: any, b: any) => a.sortOrder - b.sortOrder)
+          .map((t: any) => ({
+            provider: t.providerSlug,
+            model: t.modelName,
+            enabled: toBool(t.enabled),
+          }));
+        targetGroups.push({
+          name: def.name,
+          selector: def.selector as import('../config').SelectorType,
+          targets: groupTargets,
+        });
+      }
+    }
 
     const result: any = {
-      targets,
+      target_groups: targetGroups,
       priority: row.priority ?? 'selector',
       use_image_fallthrough: toBool(row.useImageFallthrough),
       enforce_limits: toBool(row.enforceLimits),
+      sticky_session: toBool(row.stickySession),
       ...(row.selector ? { selector: row.selector } : {}),
       ...(row.modelType ? { type: row.modelType } : {}),
       ...(row.additionalAliases ? { additional_aliases: parseJson(row.additionalAliases) } : {}),
       ...(row.advanced ? { advanced: parseJson(row.advanced) } : {}),
       // Model architecture override for inference energy calculation
       ...(row.modelArchitecture ? { model_architecture: parseJson(row.modelArchitecture) } : {}),
+      ...(row.preferredApi ? { preferred_api: parseJson(row.preferredApi) } : {}),
+      ...(row.piModel ? { pi_model: parseJson(row.piModel) } : {}),
     };
 
     if (row.metadataSource) {
@@ -1113,6 +1213,19 @@ export class ConfigRepository {
     return { initialMinutes, maxMinutes };
   }
 
+  async getBackgroundExplorationConfig(): Promise<BackgroundExplorationConfig> {
+    const enabled = await this.getSetting<boolean>('backgroundExploration.enabled', false);
+    const stalenessThresholdSeconds = await this.getSetting<number>(
+      'backgroundExploration.stalenessThresholdSeconds',
+      600
+    );
+    const workerConcurrency = await this.getSetting<number>(
+      'backgroundExploration.workerConcurrency',
+      2
+    );
+    return { enabled, stalenessThresholdSeconds, workerConcurrency };
+  }
+
   // ─── OAuth Credentials ──────────────────────────────────────────
 
   async getOAuthCredentials(
@@ -1218,22 +1331,5 @@ export class ConfigRepository {
       .from(schema.oauthCredentials);
 
     return rows;
-  }
-
-  // ─── Utility ─────────────────────────────────────────────────────
-
-  /**
-   * Returns true only when the DB has never been successfully bootstrapped.
-   * Uses a persistent 'system.bootstrapped' flag in system_settings so that
-   * an admin deliberately deleting all providers does NOT re-trigger a YAML
-   * import on the next restart.
-   */
-  async isFirstLaunch(): Promise<boolean> {
-    const bootstrapped = await this.getSetting<boolean>('system.bootstrapped', false);
-    return !bootstrapped;
-  }
-
-  async markBootstrapped(): Promise<void> {
-    await this.setSetting('system.bootstrapped', true);
   }
 }

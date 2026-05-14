@@ -32,4 +32,7 @@ export const quotaCheckerTypeEnum = pgEnum('quota_checker_type', [
   'ollama',
   'neuralwatt',
   'zenmux',
+  'devpass',
+  'wafer',
+  'opencode-go',
 ]);

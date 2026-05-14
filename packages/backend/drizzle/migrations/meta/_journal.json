@@ -239,6 +239,55 @@
       "when": 1777250517649,
       "tag": "0033_kind_shriek",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1778002107829,
+      "tag": "0034_nebulous_carlie_cooper",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1778265432515,
+      "tag": "0035_secret_living_tribunal",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1778283504796,
+      "tag": "0036_nasty_vengeance",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1778694219097,
+      "tag": "0037_hesitant_umar",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1778701038724,
+      "tag": "0038_illegal_nextwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1778724553931,
+      "tag": "0039_nebulous_matthew_murdock",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1778735850501,
+      "tag": "0040_motionless_baron_zemo",
+      "breakpoints": true
     }
   ]
 }

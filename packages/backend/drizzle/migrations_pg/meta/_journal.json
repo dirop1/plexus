@@ -288,6 +288,76 @@
       "when": 1777315426333,
       "tag": "0040_fuzzy_metal_master",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1778002108513,
+      "tag": "0041_steady_the_twelve",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1778265432744,
+      "tag": "0042_mean_crusher_hogan",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1778280149963,
+      "tag": "0043_spotty_spacker_dave",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1778287061284,
+      "tag": "0044_spooky_mojo",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1778352747584,
+      "tag": "0045_clever_darkstar",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1778683598311,
+      "tag": "0046_gifted_mandrill",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1778694222659,
+      "tag": "0047_cloudy_red_skull",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1778701041711,
+      "tag": "0048_previous_squadron_sinister",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1778724556699,
+      "tag": "0049_bouncy_scrambler",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1778735856746,
+      "tag": "0050_marvelous_jackal",
+      "breakpoints": true
     }
   ]
 }

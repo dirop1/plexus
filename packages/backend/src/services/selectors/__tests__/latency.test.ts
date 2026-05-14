@@ -52,9 +52,9 @@ describe('LatencySelector', () => {
 
   it('should select the fastest target based on avg_ttft_ms (lowest is best)', async () => {
     mockGetProviderPerformance.mockImplementation((provider, model) => {
-      if (provider === 'p1') return Promise.resolve([{ avg_ttft_ms: 100 }]);
-      if (provider === 'p2') return Promise.resolve([{ avg_ttft_ms: 50 }]); // Fastest latency
-      if (provider === 'p3') return Promise.resolve([{ avg_ttft_ms: 200 }]);
+      if (provider === 'p1') return Promise.resolve([{ target_model: 'm1', avg_ttft_ms: 100 }]);
+      if (provider === 'p2') return Promise.resolve([{ target_model: 'm2', avg_ttft_ms: 50 }]); // Fastest latency
+      if (provider === 'p3') return Promise.resolve([{ target_model: 'm3', avg_ttft_ms: 200 }]);
       return Promise.resolve([]);
     });
 
@@ -70,7 +70,7 @@ describe('LatencySelector', () => {
 
   it('should prefer targets with data over targets with no data', async () => {
     mockGetProviderPerformance.mockImplementation((provider, model) => {
-      if (provider === 'p1') return Promise.resolve([{ avg_ttft_ms: 100 }]);
+      if (provider === 'p1') return Promise.resolve([{ target_model: 'm1', avg_ttft_ms: 100 }]);
       if (provider === 'p2') return Promise.resolve([]); // No data -> Infinity
       return Promise.resolve([]);
     });
@@ -98,8 +98,8 @@ describe('LatencySelector', () => {
 
   it('should explore alternative providers when latencyExplorationRate is set', async () => {
     mockGetProviderPerformance.mockImplementation((provider, model) => {
-      if (provider === 'p1') return Promise.resolve([{ avg_ttft_ms: 50 }]);
-      if (provider === 'p2') return Promise.resolve([{ avg_ttft_ms: 100 }]);
+      if (provider === 'p1') return Promise.resolve([{ target_model: 'm1', avg_ttft_ms: 50 }]);
+      if (provider === 'p2') return Promise.resolve([{ target_model: 'm2', avg_ttft_ms: 100 }]);
       return Promise.resolve([]);
     });
 
@@ -131,8 +131,8 @@ describe('LatencySelector', () => {
 
   it('should use performanceExplorationRate as fallback when latencyExplorationRate is not set', async () => {
     mockGetProviderPerformance.mockImplementation((provider, model) => {
-      if (provider === 'p1') return Promise.resolve([{ avg_ttft_ms: 50 }]);
-      if (provider === 'p2') return Promise.resolve([{ avg_ttft_ms: 100 }]);
+      if (provider === 'p1') return Promise.resolve([{ target_model: 'm1', avg_ttft_ms: 50 }]);
+      if (provider === 'p2') return Promise.resolve([{ target_model: 'm2', avg_ttft_ms: 100 }]);
       return Promise.resolve([]);
     });
 
@@ -164,8 +164,8 @@ describe('LatencySelector', () => {
 
   it('should always select fastest when both exploration rates are 0', async () => {
     mockGetProviderPerformance.mockImplementation((provider, model) => {
-      if (provider === 'p1') return Promise.resolve([{ avg_ttft_ms: 50 }]); // Fastest
-      if (provider === 'p2') return Promise.resolve([{ avg_ttft_ms: 100 }]);
+      if (provider === 'p1') return Promise.resolve([{ target_model: 'm1', avg_ttft_ms: 50 }]); // Fastest
+      if (provider === 'p2') return Promise.resolve([{ target_model: 'm2', avg_ttft_ms: 100 }]);
       return Promise.resolve([]);
     });
 
@@ -185,6 +185,39 @@ describe('LatencySelector', () => {
     for (let i = 0; i < 20; i++) {
       const selected = await selector.select(targets);
       expect(selected?.provider).toBe('p1');
+    }
+  });
+
+  it('suppresses inline exploration when backgroundExploration.enabled is true', async () => {
+    setConfigForTesting({
+      ...makeConfig({ latencyExplorationRate: 1 }),
+      backgroundExploration: {
+        enabled: true,
+        stalenessThresholdSeconds: 600,
+        workerConcurrency: 2,
+      },
+    } as PlexusConfig);
+
+    mockGetProviderPerformance.mockImplementation((provider) => {
+      if (provider === 'p1')
+        return Promise.resolve([
+          { target_model: 'm1', avg_ttft_ms: 100, sample_count: 5, last_updated: 1000 },
+        ]);
+      if (provider === 'p2')
+        return Promise.resolve([
+          { target_model: 'm2', avg_ttft_ms: 500, sample_count: 5, last_updated: 2000 },
+        ]);
+      return Promise.resolve([]);
+    });
+
+    const targets: ModelTarget[] = [
+      { provider: 'p1', model: 'm1' },
+      { provider: 'p2', model: 'm2' },
+    ];
+
+    for (let i = 0; i < 10; i++) {
+      const selected = await selector.select(targets);
+      expect(selected).toEqual(targets[0]!);
     }
   });
 });
